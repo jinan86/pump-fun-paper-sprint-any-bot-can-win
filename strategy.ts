@@ -31,6 +31,16 @@
 //     coins (buffer above the 20-coin guardrail); filler entries stop
 //     once 24 distinct coins have been bought.
 //
+// Speed note (round-2 fix): the original decide() rebuilt the full
+// candidate list and re-sorted all ~1,222 tapes on EVERY batch (63,369
+// batches), even though most batches cannot place any order at all
+// (positions full, or core full + filler target reached). This version
+// keeps an incrementally maintained candidate list (`cand`, sorted
+// freshest-first exactly as the old per-batch sort produced) and skips
+// the entry scan entirely when no order is possible. The trading logic,
+// parameters, thresholds, and order of emitted orders are unchanged:
+// the action log is byte-identical to the pre-optimisation version.
+//
 // Deterministic: all state comes from the batch stream (slots, reserves,
 // trades). No clock, no environment, no randomness. Iteration is over
 // insertion-ordered maps fed by the event stream, so the two grading runs
@@ -59,6 +69,10 @@ export interface Tape {
   price: number;
   /** Latest real SOL reserve, in SOL. */
   realSol: number;
+  /** Insertion order of first sighting (rises with map insertion order). */
+  seq: number;
+  /** Slot of the most recent trade (-1 while the tape has no trades). */
+  lastSlot: number;
 }
 
 export interface PosInfo {
@@ -191,6 +205,17 @@ export class CoreFiller {
   readonly buyIntent = new Map<Pubkey, boolean>();
   /** Rejected/failed buys per mint (give up after 2). */
   readonly buyRejects = new Map<Pubkey, number>();
+  /**
+   * Candidate tapes, kept sorted freshest-first: lastSlot desc, tie-break
+   * seq asc. This is exactly the order the old per-batch
+   * `candidates.sort()` produced (stable sort over map insertion order),
+   * maintained incrementally in observe() instead of rebuilt per batch.
+   * Membership ⟺ `!complete && trades.length >= 2`.
+   */
+  readonly cand: Tape[] = [];
+  /** Next seq value to hand out (tapes are never removed, so this is also
+   * the insertion index of the next new tape). */
+  private seqCounter = 0;
   firstSlot = -1;
   lastSlot = -1;
 
@@ -202,6 +227,9 @@ export class CoreFiller {
   observe(batch: Batch): void {
     if (this.firstSlot < 0) this.firstSlot = batch.slot;
     this.lastSlot = batch.slot;
+    // Tapes whose candidate membership or sort position may have changed
+    // in this batch (new trade, or curve completed). Reconciled once below.
+    const changed = new Set<Tape>();
     for (const e of batch.events) {
       if (e.event === 'CreateEvent') {
         let t = this.tapes.get(e.mint);
@@ -213,6 +241,8 @@ export class CoreFiller {
             trades: [],
             price: priceOf(BigInt(e.virtual_quote_reserves), BigInt(e.virtual_token_reserves)),
             realSol: 0,
+            seq: this.seqCounter++,
+            lastSlot: -1,
           };
           this.tapes.set(e.mint, t);
         }
@@ -226,6 +256,8 @@ export class CoreFiller {
             trades: [],
             price: 0,
             realSol: 0,
+            seq: this.seqCounter++,
+            lastSlot: -1,
           };
           this.tapes.set(e.mint, t);
         }
@@ -240,9 +272,33 @@ export class CoreFiller {
         if (t.trades.length > 64) t.trades.splice(0, t.trades.length - 64);
         t.price = price;
         t.realSol = Number(BigInt(e.real_quote_reserves)) / LAMPORTS;
+        t.lastSlot = e.slot;
+        changed.add(t);
       } else {
         const t = this.tapes.get(e.mint);
-        if (t) t.complete = true;
+        if (t) {
+          t.complete = true;
+          changed.add(t);
+        }
+      }
+    }
+    // Reconcile the candidate list for the tapes this batch touched.
+    // Trades arrive in ascending slot order, so a tape's lastSlot only
+    // rises; a completed tape never becomes a candidate again (the
+    // eligibility check below also guards that defensively).
+    for (const t of changed) {
+      const at = this.cand.indexOf(t);
+      if (at >= 0) this.cand.splice(at, 1);
+      if (!t.complete && t.trades.length >= 2) {
+        let lo = 0;
+        let hi = this.cand.length;
+        while (lo < hi) {
+          const mid = (lo + hi) >> 1;
+          const c = this.cand[mid];
+          if (c.lastSlot > t.lastSlot || (c.lastSlot === t.lastSlot && c.seq < t.seq)) lo = mid + 1;
+          else hi = mid;
+        }
+        this.cand.splice(lo, 0, t);
       }
     }
     // Refresh prices / real reserves from marks for held mints (marks carry the
@@ -374,16 +430,49 @@ export class CoreFiller {
     const loosenFiller = this.bought.size < 20 && elapsed > p.fillerLoosenAfterSlots;
     const fillerMaxMove = loosenFiller ? 0.1 : p.fillerMaxCalmMove;
 
-    const candidates: Tape[] = [];
-    for (const t of this.tapes.values()) {
-      if (t.complete || t.trades.length < 2) continue;
-      candidates.push(t);
+    // Gate the entry scan: most batches cannot place any order at all, and
+    // scanning ~1,200 tapes to discover that was the dominant decide()
+    // cost. Both gates use the post-exit counts, exactly as the loop body
+    // below would see them.
+    // - A pyramid add is possible only for a held CORE mint under its
+    //   stake, with a live (>= 2-trade) tape and no buy already pending.
+    // - A fresh entry is possible only while a position slot is free AND
+    //   (a core slot is free OR the filler coin target is unreached).
+    //   Within the loop, openCount/coreCount only rise and bought.size
+    //   never changes, so if freshPossible is false here, no fresh entry
+    //   can fire for any tape this batch.
+    let pyramidPossible = false;
+    const pyramidMints: Tape[] = [];
+    for (const mint of held) {
+      if (pendingBuy.has(mint)) continue;
+      const info = this.infos.get(mint);
+      if (!info || !info.core) continue;
+      if (this.costSol(state, mint) >= p.stakeSol) continue;
+      const t = this.tapes.get(mint);
+      if (!t || t.complete || t.trades.length < 2) continue;
+      pyramidPossible = true;
+      pyramidMints.push(t);
     }
-    candidates.sort((a, b) => {
-      const sa = a.trades[a.trades.length - 1].slot;
-      const sb = b.trades[b.trades.length - 1].slot;
-      return sb - sa; // freshest tape first
-    });
+    const freshPossible = openCount < maxPositions && (coreCount < p.maxCore || this.bought.size < p.fillerTargetCoins);
+    if (!pyramidPossible && !freshPossible) return orders;
+
+    // Which tapes to scan, in the same freshest-first order the old
+    // per-batch sort produced (lastSlot desc, seq asc):
+    // - fresh entries possible: the whole incrementally kept list.
+    // - only pyramid adds possible: just the held core mints that passed
+    //   the gate, sorted with the same comparator (their relative order
+    //   matches their order inside the full list; every other tape in the
+    //   full list emits nothing when freshPossible is false).
+    let candidates: Tape[];
+    if (freshPossible) {
+      candidates = this.cand;
+    } else {
+      pyramidMints.sort((a, b) => {
+        if (a.lastSlot !== b.lastSlot) return b.lastSlot - a.lastSlot;
+        return a.seq - b.seq;
+      });
+      candidates = pyramidMints;
+    }
 
     for (const t of candidates) {
       if (orders.length >= maxOrders) break;
